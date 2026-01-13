@@ -18,6 +18,13 @@ func hash32(s string) uint32 {
 	return binary.BigEndian.Uint32(sum[:4])
 }
 
+/************** KVStore Interface **************/
+type KVStore interface {
+	Put(k, v string) error
+	Get(k string) (string, bool, error)
+	Close()
+}
+
 /************** Consistent Hash Ring **************/
 type Ring struct {
 	mu     sync.RWMutex
@@ -71,16 +78,15 @@ type RaftGroup struct {
 }
 
 func NewRaftGroup(shardID int, leader string, peers []string) *RaftGroup {
-	g := &RaftGroup{
+	return &RaftGroup{
 		ShardID: shardID,
 		Leader:  leader,
 		Peers:   peers,
 		ApplyCh: make(chan LogEntry, 256),
 	}
-	return g
 }
 
-// Mock: assume majority acks after tiny delay; we focus on orchestration + apply pipeline.
+// Mock: assume majority acks after tiny delay; focus on orchestration + apply pipeline.
 func (g *RaftGroup) Propose(key, value string) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -106,7 +112,7 @@ func (g *RaftGroup) Propose(key, value string) int {
 	return idx
 }
 
-/************** State Machine (in-memory for Step 2) **************/
+/************** MemKV (still useful for fallback/debug) **************/
 type MemKV struct {
 	mu sync.RWMutex
 	m  map[string]string
@@ -114,23 +120,25 @@ type MemKV struct {
 
 func NewMemKV() *MemKV { return &MemKV{m: make(map[string]string)} }
 
-func (kv *MemKV) Put(k, v string) {
+func (kv *MemKV) Put(k, v string) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 	kv.m[k] = v
+	return nil
 }
-func (kv *MemKV) Get(k string) (string, bool) {
+func (kv *MemKV) Get(k string) (string, bool, error) {
 	kv.mu.RLock()
 	defer kv.mu.RUnlock()
 	v, ok := kv.m[k]
-	return v, ok
+	return v, ok, nil
 }
+func (kv *MemKV) Close() {}
 
 /************** Node (hosts multiple raft groups) **************/
 type Node struct {
 	NodeID string
 	Groups map[int]*RaftGroup // shardID -> group
-	Store  *MemKV
+	Store  KVStore
 }
 
 type Cluster struct {
@@ -149,7 +157,7 @@ func (c *Cluster) routeLeader(key string) (leader string, point uint32) {
 }
 
 func main() {
-	// ---- Build cluster ----
+	// ---- Build ring ----
 	ring := NewRing()
 	ring.AddNode("nodeA:8081", 16)
 	ring.AddNode("nodeB:8082", 16)
@@ -161,12 +169,12 @@ func main() {
 		Nodes:     make(map[string]*Node),
 	}
 
-	// create nodes
+	// create nodes (Store uses C++ engine via cgo: CppStore)
 	for _, id := range []string{"nodeA:8081", "nodeB:8082", "nodeC:8083"} {
 		cluster.Nodes[id] = &Node{
 			NodeID: id,
 			Groups: make(map[int]*RaftGroup),
-			Store:  NewMemKV(),
+			Store:  NewCppStore(), // <--- C++ store
 		}
 	}
 
@@ -178,28 +186,26 @@ func main() {
 	}
 	peers := []string{"nodeA:8081", "nodeB:8082", "nodeC:8083"}
 
-	// create raft group per shard, hosted on every node (leader on one node, follower semantics omitted in MVP)
+	// create raft group per shard, hosted on every node (follower semantics omitted in MVP)
 	for shard := 0; shard < cluster.NumShards; shard++ {
 		leader := shardLeader[shard]
 		for _, n := range cluster.Nodes {
-			// every node "has" the group; only leader proposes in this MVP
 			n.Groups[shard] = NewRaftGroup(shard, leader, peers)
 		}
 	}
 
-	// start appliers on every node: when group applies on leader, we apply to leader's local store
-	// (in Step 3 we'll apply to RocksDB)
+	// start appliers on every node:
+	// when group applies on leader, apply to leader's local store (C++ engine here)
 	for _, n := range cluster.Nodes {
-		for shard, g := range n.Groups {
-			_ = shard
+		for _, g := range n.Groups {
 			go func(node *Node, group *RaftGroup) {
 				for e := range group.ApplyCh {
-					// only apply if this node is the leader for this shard
+					// only leader applies in this MVP
 					if node.NodeID != group.Leader {
 						continue
 					}
-					node.Store.Put(e.Key, e.Value)
-					log.Printf("[APPLY] shard=%d leader=%s apply idx=%d -> memKV[%s]=%s",
+					_ = node.Store.Put(e.Key, e.Value)
+					log.Printf("[APPLY] shard=%d leader=%s apply idx=%d -> store[%s]=%s",
 						group.ShardID, group.Leader, e.Index, e.Key, e.Value)
 				}
 			}(n, g)
@@ -237,9 +243,9 @@ func main() {
 			http.Error(w, "missing key", http.StatusBadRequest)
 			return
 		}
+
 		leader, _ := cluster.routeLeader(key)
 		shardID := cluster.shardOf(key)
-
 		log.Printf("[ROUTE] key=%s shard=%d -> leader=%s", key, shardID, leader)
 
 		leaderNode := cluster.Nodes[leader]
@@ -255,7 +261,7 @@ func main() {
 
 		idx := group.Propose(key, val)
 
-		// for MVP: wait until committed/applied (small timeout) so GET after PUT is consistent in demo
+		// for demo: wait until committed (small timeout) so GET after PUT is consistent
 		deadline := time.Now().Add(500 * time.Millisecond)
 		for time.Now().Before(deadline) {
 			group.mu.Lock()
@@ -292,7 +298,7 @@ func main() {
 			http.Error(w, "leader not found", http.StatusInternalServerError)
 			return
 		}
-		v, ok := leaderNode.Store.Get(key)
+		v, ok, _ := leaderNode.Store.Get(key)
 		if !ok {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
@@ -330,6 +336,6 @@ func main() {
 		_ = json.NewEncoder(w).Encode(out)
 	})
 
-	log.Println("router+multiraft listening on :8080")
+	log.Println("router+multiraft+cgo(C++) listening on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

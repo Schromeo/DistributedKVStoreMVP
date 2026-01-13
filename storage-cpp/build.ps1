@@ -1,32 +1,57 @@
 $ErrorActionPreference = "Stop"
 
-$Gpp = "C:\msys64\ucrt64\bin\g++.exe"
-if (!(Test-Path $Gpp)) {
-    throw "g++ not found at $Gpp"
-}
+$GppPath = "C:\msys64\ucrt64\bin\g++.exe"
+if (!(Test-Path $GppPath)) { throw "g++ not found at $GppPath" }
 
-$Root   = $PSScriptRoot
-$OutDir = Join-Path $Root "build"
-
+$RootDir = $PSScriptRoot
+$OutDir  = Join-Path $RootDir "build"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-$src = Join-Path $Root "kv.cpp"
-$dll = Join-Path $OutDir "kv.dll"
-$lib = Join-Path $OutDir "libkv.dll.a"
+$SrcPath    = Join-Path $RootDir "kv.cpp"
+$DllPath    = Join-Path $OutDir  "kv.dll"
+$ImplibPath = Join-Path $OutDir  "libkv.dll.a"
 
-# 参数数组（PowerShell-safe）
+$IncDir = "C:/msys64/ucrt64/include"
+$LibDir = "C:/msys64/ucrt64/lib"
+
+# IMPORTANT: use static rocksdb lib (contains full C++ symbols)
+$RocksStaticLib = "C:/msys64/ucrt64/lib/librocksdb.a"
+
 $args = @(
     "-O2",
     "-shared",
-    "-std=c++17",
-    $src,
-    "-o", $dll,
-    "-Wl,--out-implib=$lib",
+    "-std=c++20",
+    "-I$IncDir",
+    $SrcPath,
+    "-o", $DllPath,
+
+    "-L$LibDir",
+    "-Wl,--out-implib=$ImplibPath",
+
+    "-pthread",
+
+    # Force-include RocksDB static library
+    "-Wl,--whole-archive",
+    $RocksStaticLib,
+    "-Wl,--no-whole-archive",
+
+    # Common deps (if missing, we’ll install via pacman)
+    "-lsnappy",
+    "-lzstd",
+    "-llz4",
+    "-lbz2",
+    "-lz",
+
+    # Windows system libs
+    "-lshlwapi",
+    "-lrpcrt4",
+    "-lws2_32",
+
     "-static-libgcc",
     "-static-libstdc++"
 )
 
-& $Gpp @args
+& $GppPath @args
 
-Write-Host "Built: $dll"
-Write-Host "Built: $lib"
+Write-Host "Built: $DllPath"
+Write-Host "Built: $ImplibPath"
